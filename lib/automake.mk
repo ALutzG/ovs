@@ -49,6 +49,12 @@ lib_libopenvswitch_la_SOURCES = \
 	lib/compiler.h \
 	lib/connectivity.c \
 	lib/connectivity.h \
+	lib/conntrack-icmp.c \
+	lib/conntrack-private.h \
+	lib/conntrack-tcp.c \
+	lib/conntrack-other.c \
+	lib/conntrack.c \
+	lib/conntrack.h \
 	lib/coverage.c \
 	lib/coverage.h \
 	lib/crc32c.c \
@@ -94,7 +100,6 @@ lib_libopenvswitch_la_SOURCES = \
 	lib/hindex.c \
 	lib/hindex.h \
 	lib/hmap.c \
-	lib/hmap.h \
 	lib/hmapx.c \
 	lib/hmapx.h \
 	lib/id-pool.c \
@@ -102,7 +107,6 @@ lib_libopenvswitch_la_SOURCES = \
 	lib/jhash.c \
 	lib/jhash.h \
 	lib/json.c \
-	lib/json.h \
 	lib/jsonrpc.c \
 	lib/jsonrpc.h \
 	lib/lacp.c \
@@ -136,6 +140,8 @@ lib_libopenvswitch_la_SOURCES = \
 	lib/netlink.h \
 	lib/nx-match.c \
 	lib/nx-match.h \
+	lib/object-collection.c \
+	lib/object-collection.h \
 	lib/odp-execute.c \
 	lib/odp-execute.h \
 	lib/odp-util.c \
@@ -164,6 +170,8 @@ lib_libopenvswitch_la_SOURCES = \
 	lib/ovs-atomic.h \
 	lib/ovs-lldp.c \
 	lib/ovs-lldp.h \
+	lib/ovs-numa.c \
+	lib/ovs-numa.h \
 	lib/ovs-rcu.c \
 	lib/ovs-rcu.h \
 	lib/ovs-router.h \
@@ -179,6 +187,8 @@ lib_libopenvswitch_la_SOURCES = \
 	lib/ovsdb-idl.h \
 	lib/ovsdb-map-op.c \
 	lib/ovsdb-map-op.h \
+	lib/ovsdb-condition.h \
+	lib/ovsdb-condition.c \
 	lib/ovsdb-parser.c \
 	lib/ovsdb-parser.h \
 	lib/ovsdb-types.c \
@@ -215,7 +225,6 @@ lib_libopenvswitch_la_SOURCES = \
 	lib/sha1.c \
 	lib/sha1.h \
 	lib/shash.c \
-	lib/shash.h \
 	lib/simap.c \
 	lib/simap.h \
 	lib/smap.c \
@@ -272,6 +281,7 @@ lib_libopenvswitch_la_SOURCES = \
 	lib/vconn-provider.h \
 	lib/vconn-stream.c \
 	lib/vconn.c \
+	lib/versions.h \
 	lib/vlan-bitmap.c \
 	lib/vlan-bitmap.h \
 	lib/vlog.c \
@@ -292,6 +302,7 @@ lib_libopenvswitch_la_SOURCES += \
 	lib/latch-windows.c \
 	lib/route-table-stub.c \
 	lib/if-notifier-stub.c \
+	lib/stream-windows.c \
 	lib/strsep.c
 else
 lib_libopenvswitch_la_SOURCES += \
@@ -349,8 +360,6 @@ lib_libopenvswitch_la_SOURCES += \
 	lib/netlink-protocol.h \
 	lib/netlink-socket.c \
 	lib/netlink-socket.h \
-	lib/ovs-numa.c \
-	lib/ovs-numa.h \
 	lib/rtnetlink.c \
 	lib/rtnetlink.h \
 	lib/route-table.c \
@@ -372,6 +381,8 @@ lib_libopenvswitch_la_SOURCES += \
 	lib/dpif-netlink.c \
 	lib/dpif-netlink.h \
 	lib/netdev-windows.c \
+	lib/netlink-conntrack.c \
+	lib/netlink-conntrack.h \
 	lib/netlink-notifier.c \
 	lib/netlink-notifier.h \
 	lib/netlink-protocol.h \
@@ -422,8 +433,11 @@ EXTRA_DIST += \
 	lib/dh1024.pem \
 	lib/dh2048.pem \
 	lib/dh4096.pem \
+	lib/common.xml \
 	lib/dirs.c.in \
-	lib/db-ctl-base.xml
+	lib/db-ctl-base.xml \
+	lib/ssl.xml \
+	lib/vlog.xml
 
 MAN_FRAGMENTS += \
 	lib/colors.man \

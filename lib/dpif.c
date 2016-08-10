@@ -40,7 +40,7 @@
 #include "poll-loop.h"
 #include "route-table.h"
 #include "seq.h"
-#include "shash.h"
+#include "openvswitch/shash.h"
 #include "sset.h"
 #include "timeval.h"
 #include "tnl-neigh-cache.h"
@@ -192,8 +192,6 @@ dp_unregister_provider__(const char *type)
 
     node = shash_find(&dpif_classes, type);
     if (!node) {
-        VLOG_WARN("attempted to unregister a datapath provider that is not "
-                  "registered: %s", type);
         return EAFNOSUPPORT;
     }
 
@@ -610,6 +608,23 @@ dpif_port_exists(const struct dpif *dpif, const char *devname)
     }
 
     return !error;
+}
+
+/* Refreshes configuration of 'dpif's port. */
+int
+dpif_port_set_config(struct dpif *dpif, odp_port_t port_no,
+                     const struct smap *cfg)
+{
+    int error = 0;
+
+    if (dpif->dpif_class->port_set_config) {
+        error = dpif->dpif_class->port_set_config(dpif, port_no, cfg);
+        if (error) {
+            log_operation(dpif, "port_set_config", error);
+        }
+    }
+
+    return error;
 }
 
 /* Looks up port number 'port_no' in 'dpif'.  On success, returns 0 and
@@ -1081,6 +1096,7 @@ dpif_flow_dump_next(struct dpif_flow_dump_thread *thread,
 
 struct dpif_execute_helper_aux {
     struct dpif *dpif;
+    const struct flow *flow;
     int error;
 };
 
@@ -1093,6 +1109,7 @@ dpif_execute_helper_cb(void *aux_, struct dp_packet_batch *packets_,
     struct dpif_execute_helper_aux *aux = aux_;
     int type = nl_attr_type(action);
     struct dp_packet *packet = packets_->packets[0];
+    struct dp_packet *trunc_packet = NULL, *orig_packet;
 
     ovs_assert(packets_->count == 1);
 
@@ -1107,7 +1124,8 @@ dpif_execute_helper_cb(void *aux_, struct dp_packet_batch *packets_,
         struct ofpbuf execute_actions;
         uint64_t stub[256 / 8];
         struct pkt_metadata *md = &packet->md;
-        bool dst_set;
+        bool dst_set, clone = false;
+        uint32_t cutlen = dp_packet_get_cutlen(packet);
 
         dst_set = flow_tnl_dst_is_set(&md->tunnel);
         if (dst_set) {
@@ -1125,7 +1143,24 @@ dpif_execute_helper_cb(void *aux_, struct dp_packet_batch *packets_,
             execute.actions_len = NLA_ALIGN(action->nla_len);
         }
 
+        orig_packet = packet;
+
+        if (cutlen > 0 && (type == OVS_ACTION_ATTR_OUTPUT ||
+            type == OVS_ACTION_ATTR_TUNNEL_PUSH ||
+            type == OVS_ACTION_ATTR_TUNNEL_POP ||
+            type == OVS_ACTION_ATTR_USERSPACE)) {
+            if (!may_steal) {
+                trunc_packet = dp_packet_clone(packet);
+                packet = trunc_packet;
+                clone = true;
+            }
+
+            dp_packet_set_size(packet, dp_packet_size(packet) - cutlen);
+            dp_packet_reset_cutlen(orig_packet);
+        }
+
         execute.packet = packet;
+        execute.flow = aux->flow;
         execute.needs_help = false;
         execute.probe = false;
         execute.mtu = 0;
@@ -1134,6 +1169,10 @@ dpif_execute_helper_cb(void *aux_, struct dp_packet_batch *packets_,
 
         if (dst_set) {
             ofpbuf_uninit(&execute_actions);
+        }
+
+        if (clone) {
+            dp_packet_delete(trunc_packet);
         }
         break;
     }
@@ -1146,6 +1185,7 @@ dpif_execute_helper_cb(void *aux_, struct dp_packet_batch *packets_,
     case OVS_ACTION_ATTR_SET:
     case OVS_ACTION_ATTR_SET_MASKED:
     case OVS_ACTION_ATTR_SAMPLE:
+    case OVS_ACTION_ATTR_TRUNC:
     case OVS_ACTION_ATTR_UNSPEC:
     case __OVS_ACTION_ATTR_MAX:
         OVS_NOT_REACHED();
@@ -1160,7 +1200,7 @@ dpif_execute_helper_cb(void *aux_, struct dp_packet_batch *packets_,
 static int
 dpif_execute_with_help(struct dpif *dpif, struct dpif_execute *execute)
 {
-    struct dpif_execute_helper_aux aux = {dpif, 0};
+    struct dpif_execute_helper_aux aux = {dpif, execute->flow, 0};
     struct dp_packet_batch pb;
 
     COVERAGE_INC(dpif_execute_with_help);

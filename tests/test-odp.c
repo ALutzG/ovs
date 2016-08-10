@@ -86,7 +86,6 @@ parse_keys(bool wc_keys)
             /* Convert cls_rule back to odp_key. */
             ofpbuf_uninit(&odp_key);
             ofpbuf_init(&odp_key, 0);
-            odp_parms.odp_in_port = flow.in_port.odp_port;
             odp_flow_key_from_flow(&odp_parms, &odp_key);
 
             if (odp_key.size > ODPUTIL_FLOW_KEY_BYTES) {
@@ -164,7 +163,7 @@ parse_filter(char *filter_parse)
         memset(&flow_filter, 0, sizeof(flow_filter));
         memset(&wc_filter, 0, sizeof(wc_filter));
 
-        error = parse_ofp_exact_flow(&flow_filter, &wc_filter.masks, filter,
+        error = parse_ofp_exact_flow(&flow_filter, &wc_filter, filter,
                                      NULL);
         if (error) {
             ovs_fatal(0, "Failed to parse filter (%s)", error);

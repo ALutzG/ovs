@@ -34,7 +34,7 @@
 #include "openvswitch/dynamic-string.h"
 #include "fatal-signal.h"
 #include "hash.h"
-#include "json.h"
+#include "openvswitch/json.h"
 #include "ovsdb-data.h"
 #include "ovsdb-idl.h"
 #include "poll-loop.h"
@@ -107,7 +107,7 @@ static void do_vsctl(const char *args, struct ctl_command *, size_t n,
  * either store a positive values on successful implementing the new
  * interface, or -1 on failure.
  *
- * Unless -no-wait command line option is specified,
+ * Unless --no-wait command line option is specified,
  * post_db_reload_do_checks() is called right after any configuration
  * changes is picked up (i.e. reload) by ovs-vswitchd. Any error detected
  * post OVSDB reload is reported as ovs-vsctl errors. OVS-vswitchd logs
@@ -287,7 +287,7 @@ parse_options(int argc, char *argv[], struct shash *local_options)
             }
             shash_add_nocopy(local_options,
                              xasprintf("--%s", options[idx].name),
-                             optarg ? xstrdup(optarg) : NULL);
+                             nullable_xstrdup(optarg));
             break;
 
         case 'h':
@@ -2348,7 +2348,9 @@ static const struct ctl_table_class tables[] = {
       {NULL, NULL, NULL}}},
 
     {&ovsrec_table_flow_sample_collector_set,
-     {{NULL, NULL, NULL},
+     {{&ovsrec_table_flow_sample_collector_set,
+       &ovsrec_flow_sample_collector_set_col_id,
+       NULL},
       {NULL, NULL, NULL}}},
 
     {NULL, {{NULL, NULL, NULL}, {NULL, NULL, NULL}}}
@@ -2472,30 +2474,37 @@ vsctl_parent_process_info(void)
 {
 #ifdef __linux__
     pid_t parent_pid;
-    char *procfile;
     struct ds s;
-    FILE *f;
 
     parent_pid = getppid();
-    procfile = xasprintf("/proc/%d/cmdline", parent_pid);
-
-    f = fopen(procfile, "r");
-    if (!f) {
-        VLOG_WARN("%s: open failed (%s)", procfile, ovs_strerror(errno));
-        free(procfile);
-        return NULL;
-    }
-    free(procfile);
-
     ds_init(&s);
-    for (;;) {
-        int c = getc(f);
-        if (!c || c == EOF) {
-            break;
+
+    /* Retrive the command line of the parent process, except the init
+     * process since /proc/0 does not exist. */
+    if (parent_pid) {
+        char *procfile;
+        FILE *f;
+
+        procfile = xasprintf("/proc/%d/cmdline", parent_pid);
+
+        f = fopen(procfile, "r");
+        if (!f) {
+            free(procfile);
+            return NULL;
         }
-        ds_put_char(&s, c);
+        free(procfile);
+
+        for (;;) {
+            int c = getc(f);
+            if (!c || c == EOF) {
+            break;
+            }
+            ds_put_char(&s, c);
+        }
+        fclose(f);
+    } else {
+        ds_put_cstr(&s, "init");
     }
-    fclose(f);
 
     ds_put_format(&s, " (pid %d)", parent_pid);
 
@@ -2542,7 +2551,7 @@ do_vsctl(const char *args, struct ctl_command *commands, size_t n_commands,
 
     if (wait_for_reload) {
         ovsdb_idl_txn_increment(txn, &ovs->header_,
-                                &ovsrec_open_vswitch_col_next_cfg);
+                                &ovsrec_open_vswitch_col_next_cfg, false);
     }
 
     post_db_reload_check_init();

@@ -40,11 +40,24 @@ the "arp" action, and an action for generating
 
 ** IPv6
 
-*** ND versus ARP
+*** Drop invalid source IPv6 addresses
 
-*** IPv6 routing
+*** Don't forward non-routable addresses
 
-*** ICMPv6
+*** ICMPv6 action
+
+Similar to the ICMPv4 action, ICMPv6 messages should be generated.
+
+*** Neighbor Discovery
+
+**** ND Router Advertisements
+
+The router ports should periodically send out ND Router Advertisements
+and respond to Router Solicitations.
+
+**** Learn MAC bindings on ND Solicitations
+
+**** Properly set RSO flags
 
 ** Dynamic IP to MAC bindings
 
@@ -124,12 +137,6 @@ large.
     The part of OpenStack that manages VMs (Nova) tells the networking component
     (Neutron) where a port will be located, as opposed to the networking
     component discovering it.
-
-** Gratuitous ARP generation
-
-   ovn-controller should generate a GARP when a port is bound to a chassis.
-   This is needed when ports are migrated from one chassis to another, such
-   as live migrating a VM.
 
 * ovsdb-server
 
@@ -241,3 +248,9 @@ large.
 ** Support reject action.
 
 ** Support log option.
+
+** We currently use ct_label[0] to mark connections that have been blocked
+   by an ACL.  It would be nice in the logical flow syntax to have a
+   symbolic name like "ct_label.blocked" to make things more clear, as
+   well as to change the implementation of "blocked" in the future
+   if needed.

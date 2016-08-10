@@ -49,6 +49,7 @@
 #include "random.h"
 #include "tun-metadata.h"
 #include "unaligned.h"
+#include "util.h"
 #include "uuid.h"
 
 VLOG_DEFINE_THIS_MODULE(ofp_util);
@@ -101,7 +102,7 @@ ofputil_netmask_to_wcbits(ovs_be32 netmask)
 void
 ofputil_wildcard_from_ofpfw10(uint32_t ofpfw, struct flow_wildcards *wc)
 {
-    BUILD_ASSERT_DECL(FLOW_WC_SEQ == 35);
+    BUILD_ASSERT_DECL(FLOW_WC_SEQ == 36);
 
     /* Initialize most of wc. */
     flow_wildcards_init_catchall(wc);
@@ -1575,10 +1576,6 @@ ofputil_decode_flow_mod(struct ofputil_flow_mod *fm,
 {
     ovs_be16 raw_flags;
     enum ofperr error;
-
-    /* Ignored for non-delete actions */
-    fm->delete_reason = OFPRR_DELETE;
-
     struct ofpbuf b = ofpbuf_const_initializer(oh, ntohs(oh->length));
     enum ofpraw raw = ofpraw_pull_assert(&b);
     if (raw == OFPRAW_OFPT11_FLOW_MOD) {
@@ -7355,6 +7352,38 @@ ofputil_normalize_match_quiet(struct match *match)
     ofputil_normalize_match__(match, false);
 }
 
+static size_t
+parse_value(const char *s, const char *delimiters)
+{
+    size_t n = 0;
+
+    /* Iterate until we reach a delimiter.
+     *
+     * strchr(s, '\0') returns s+strlen(s), so this test handles the null
+     * terminator at the end of 's'.  */
+    while (!strchr(delimiters, s[n])) {
+        if (s[n] == '(') {
+            int level = 0;
+            do {
+                switch (s[n]) {
+                case '\0':
+                    return n;
+                case '(':
+                    level++;
+                    break;
+                case ')':
+                    level--;
+                    break;
+                }
+                n++;
+            } while (level > 0);
+        } else {
+            n++;
+        }
+    }
+    return n;
+}
+
 /* Parses a key or a key-value pair from '*stringp'.
  *
  * On success: Stores the key into '*keyp'.  Stores the value, if present, into
@@ -7368,58 +7397,49 @@ ofputil_normalize_match_quiet(struct match *match)
 bool
 ofputil_parse_key_value(char **stringp, char **keyp, char **valuep)
 {
-    char *pos, *key, *value;
-    size_t key_len;
-
-    pos = *stringp;
-    pos += strspn(pos, ", \t\r\n");
-    if (*pos == '\0') {
+    /* Skip white space and delimiters.  If that brings us to the end of the
+     * input string, we are done and there are no more key-value pairs. */
+    *stringp += strspn(*stringp, ", \t\r\n");
+    if (**stringp == '\0') {
         *keyp = *valuep = NULL;
         return false;
     }
 
-    key = pos;
-    key_len = strcspn(pos, ":=(, \t\r\n");
-    if (key[key_len] == ':' || key[key_len] == '=') {
-        /* The value can be separated by a colon. */
-        size_t value_len;
-
-        value = key + key_len + 1;
-        value_len = strcspn(value, ", \t\r\n");
-        pos = value + value_len + (value[value_len] != '\0');
-        value[value_len] = '\0';
-    } else if (key[key_len] == '(') {
-        /* The value can be surrounded by balanced parentheses.  The outermost
-         * set of parentheses is removed. */
-        int level = 1;
-        size_t value_len;
-
-        value = key + key_len + 1;
-        for (value_len = 0; level > 0; value_len++) {
-            switch (value[value_len]) {
-            case '\0':
-                level = 0;
-                break;
-
-            case '(':
-                level++;
-                break;
-
-            case ')':
-                level--;
-                break;
-            }
-        }
-        value[value_len - 1] = '\0';
-        pos = value + value_len;
-    } else {
-        /* There might be no value at all. */
-        value = key + key_len;  /* Will become the empty string below. */
-        pos = key + key_len + (key[key_len] != '\0');
-    }
+    /* Extract the key and the delimiter that ends the key-value pair or begins
+     * the value.  Advance the input position past the key and delimiter. */
+    char *key = *stringp;
+    size_t key_len = strcspn(key, ":=(, \t\r\n");
+    char key_delim = key[key_len];
     key[key_len] = '\0';
+    *stringp += key_len + (key_delim != '\0');
 
-    *stringp = pos;
+    /* Figure out what delimiter ends the value:
+     *
+     *     - If key_delim is ":" or "=", the value extends until white space
+     *       or a comma.
+     *
+     *     - If key_delim is "(", the value extends until ")".
+     *
+     * If there is no value, we are done. */
+    const char *value_delims;
+    if (key_delim == ':' || key_delim == '=') {
+        value_delims = ", \t\r\n";
+    } else if (key_delim == '(') {
+        value_delims = ")";
+    } else {
+        *keyp = key;
+        *valuep = key + key_len; /* Empty string. */
+        return true;
+    }
+
+    /* Extract the value.  Advance the input position past the value and
+     * delimiter. */
+    char *value = *stringp;
+    size_t value_len = parse_value(value, value_delims);
+    char value_delim = value[value_len];
+    value[value_len] = '\0';
+    *stringp += value_len + (value_delim != '\0');
+
     *keyp = key;
     *valuep = value;
     return true;
@@ -7944,6 +7964,92 @@ ofputil_decode_port_stats_request(const struct ofp_header *request,
     }
 }
 
+static void
+ofputil_ipfix_stats_to_reply(const struct ofputil_ipfix_stats *ois,
+                            struct nx_ipfix_stats_reply *reply)
+{
+    reply->collector_set_id = htonl(ois->collector_set_id);
+    reply->total_flows = htonll(ois->total_flows);
+    reply->current_flows = htonll(ois->current_flows);
+    reply->pkts = htonll(ois->pkts);
+    reply->ipv4_pkts = htonll(ois->ipv4_pkts);
+    reply->ipv6_pkts = htonll(ois->ipv6_pkts);
+    reply->error_pkts = htonll(ois->error_pkts);
+    reply->ipv4_error_pkts = htonll(ois->ipv4_error_pkts);
+    reply->ipv6_error_pkts = htonll(ois->ipv6_error_pkts);
+    reply->tx_pkts = htonll(ois->tx_pkts);
+    reply->tx_errors = htonll(ois->tx_errors);
+    memset(reply->pad, 0, sizeof reply->pad);
+}
+
+/* Encode a ipfix stat for 'ois' and append it to 'replies'. */
+void
+ofputil_append_ipfix_stat(struct ovs_list *replies,
+                         const struct ofputil_ipfix_stats *ois)
+{
+    struct nx_ipfix_stats_reply *reply = ofpmp_append(replies, sizeof *reply);
+    ofputil_ipfix_stats_to_reply(ois, reply);
+}
+
+static enum ofperr
+ofputil_ipfix_stats_from_nx(struct ofputil_ipfix_stats *is,
+                            const struct nx_ipfix_stats_reply *reply)
+{
+    is->collector_set_id = ntohl(reply->collector_set_id);
+    is->total_flows = ntohll(reply->total_flows);
+    is->current_flows = ntohll(reply->current_flows);
+    is->pkts = ntohll(reply->pkts);
+    is->ipv4_pkts = ntohll(reply->ipv4_pkts);
+    is->ipv6_pkts = ntohll(reply->ipv6_pkts);
+    is->error_pkts = ntohll(reply->error_pkts);
+    is->ipv4_error_pkts = ntohll(reply->ipv4_error_pkts);
+    is->ipv6_error_pkts = ntohll(reply->ipv6_error_pkts);
+    is->tx_pkts = ntohll(reply->tx_pkts);
+    is->tx_errors = ntohll(reply->tx_errors);
+
+    return 0;
+}
+
+int
+ofputil_pull_ipfix_stats(struct ofputil_ipfix_stats *is, struct ofpbuf *msg)
+{
+    enum ofperr error;
+    enum ofpraw raw;
+
+    memset(is, 0xFF, sizeof (*is));
+
+    error = (msg->header ? ofpraw_decode(&raw, msg->header)
+             : ofpraw_pull(&raw, msg));
+    if (error) {
+        return error;
+    }
+
+    if (!msg->size) {
+        return EOF;
+    } else if (raw == OFPRAW_NXST_IPFIX_BRIDGE_REPLY ||
+               raw == OFPRAW_NXST_IPFIX_FLOW_REPLY) {
+        struct nx_ipfix_stats_reply *reply;
+
+        reply = ofpbuf_try_pull(msg, sizeof *reply);
+        return ofputil_ipfix_stats_from_nx(is, reply);
+    } else {
+        OVS_NOT_REACHED();
+    }
+}
+
+
+/* Returns the number of ipfix stats elements in
+ * OFPTYPE_IPFIX_BRIDGE_STATS_REPLY or OFPTYPE_IPFIX_FLOW_STATS_REPLY
+ * message 'oh'. */
+size_t
+ofputil_count_ipfix_stats(const struct ofp_header *oh)
+{
+    struct ofpbuf b = ofpbuf_const_initializer(oh, ntohs(oh->length));
+    ofpraw_pull_assert(&b);
+
+    return b.size / sizeof(struct ofputil_ipfix_stats);
+}
+
 /* Frees all of the "struct ofputil_bucket"s in the 'buckets' list. */
 void
 ofputil_bucket_list_destroy(struct ovs_list *buckets)
@@ -8095,7 +8201,7 @@ void
 ofputil_uninit_group_desc(struct ofputil_group_desc *gd)
 {
     ofputil_bucket_list_destroy(&gd->buckets);
-    free(&gd->props.fields);
+    ofputil_group_properties_destroy(&gd->props);
 }
 
 /* Decodes the OpenFlow group description request in 'oh', returning the group
@@ -8761,6 +8867,20 @@ ofputil_init_group_properties(struct ofputil_group_props *gp)
     memset(gp, 0, sizeof *gp);
 }
 
+void
+ofputil_group_properties_copy(struct ofputil_group_props *to,
+                              const struct ofputil_group_props *from)
+{
+    *to = *from;
+    to->fields.values = xmemdup(from->fields.values, from->fields.values_size);
+}
+
+void
+ofputil_group_properties_destroy(struct ofputil_group_props *gp)
+{
+    free(gp->fields.values);
+}
+
 static enum ofperr
 parse_group_prop_ntr_selection_method(struct ofpbuf *payload,
                                       enum ofp11_group_type group_type,
@@ -8787,6 +8907,7 @@ parse_group_prop_ntr_selection_method(struct ofpbuf *payload,
     switch (group_cmd) {
     case OFPGC15_ADD:
     case OFPGC15_MODIFY:
+    case OFPGC15_ADD_OR_MOD:
         break;
     case OFPGC15_DELETE:
     case OFPGC15_INSERT_BUCKET:
@@ -9018,6 +9139,7 @@ void
 ofputil_uninit_group_mod(struct ofputil_group_mod *gm)
 {
     ofputil_bucket_list_destroy(&gm->buckets);
+    ofputil_group_properties_destroy(&gm->props);
 }
 
 static struct ofpbuf *
@@ -9115,6 +9237,7 @@ bad_group_cmd(enum ofp15_group_mod_command cmd)
     switch (cmd) {
     case OFPGC15_ADD:
     case OFPGC15_MODIFY:
+    case OFPGC15_ADD_OR_MOD:
     case OFPGC15_DELETE:
         version = "1.1";
         opt_version = "11";
@@ -9136,6 +9259,7 @@ bad_group_cmd(enum ofp15_group_mod_command cmd)
         break;
 
     case OFPGC15_MODIFY:
+    case OFPGC15_ADD_OR_MOD:
         cmd_str = "mod-group";
         break;
 
@@ -9175,7 +9299,7 @@ ofputil_encode_group_mod(enum ofp_version ofp_version,
     case OFP12_VERSION:
     case OFP13_VERSION:
     case OFP14_VERSION:
-        if (gm->command > OFPGC11_DELETE) {
+        if (gm->command > OFPGC11_DELETE && gm->command != OFPGC11_ADD_OR_MOD) {
             bad_group_cmd(gm->command);
         }
         return ofputil_encode_ofp11_group_mod(ofp_version, gm);
@@ -9246,6 +9370,7 @@ ofputil_pull_ofp15_group_mod(struct ofpbuf *msg, enum ofp_version ofp_version,
 
     case OFPGC11_ADD:
     case OFPGC11_MODIFY:
+    case OFPGC11_ADD_OR_MOD:
     case OFPGC11_DELETE:
     default:
         if (gm->command_bucket_id == OFPG15_BUCKET_ALL) {
@@ -9324,6 +9449,7 @@ ofputil_decode_group_mod(const struct ofp_header *oh,
     switch (gm->command) {
     case OFPGC11_ADD:
     case OFPGC11_MODIFY:
+    case OFPGC11_ADD_OR_MOD:
     case OFPGC11_DELETE:
     case OFPGC15_INSERT_BUCKET:
         break;
@@ -9364,6 +9490,36 @@ ofputil_decode_group_mod(const struct ofp_header *oh,
     }
 
     return 0;
+}
+
+/* Destroys 'bms'. */
+void
+ofputil_encode_bundle_msgs(struct ofputil_bundle_msg *bms, size_t n_bms,
+                           struct ovs_list *requests,
+                           enum ofputil_protocol protocol)
+{
+    enum ofp_version version = ofputil_protocol_to_ofp_version(protocol);
+
+    for (size_t i = 0; i < n_bms; i++) {
+        struct ofpbuf *request = NULL;
+
+        switch ((int)bms[i].type) {
+        case OFPTYPE_FLOW_MOD:
+            request = ofputil_encode_flow_mod(&bms[i].fm, protocol);
+            free(CONST_CAST(struct ofpact *, bms[i].fm.ofpacts));
+            break;
+        case OFPTYPE_GROUP_MOD:
+            request = ofputil_encode_group_mod(version, &bms[i].gm);
+            ofputil_uninit_group_mod(&bms[i].gm);
+            break;
+        default:
+            break;
+        }
+        if (request) {
+            ovs_list_push_back(requests, &request->list_node);
+        }
+    }
+    free(bms);
 }
 
 /* Parse a queue status request message into 'oqsr'.
@@ -9749,11 +9905,12 @@ ofputil_is_bundlable(enum ofptype type)
         /* Minimum required by OpenFlow 1.4. */
     case OFPTYPE_PORT_MOD:
     case OFPTYPE_FLOW_MOD:
+        /* Other supported types. */
+    case OFPTYPE_GROUP_MOD:
         return true;
 
         /* Nice to have later. */
     case OFPTYPE_FLOW_MOD_TABLE_ID:
-    case OFPTYPE_GROUP_MOD:
     case OFPTYPE_TABLE_MOD:
     case OFPTYPE_METER_MOD:
     case OFPTYPE_PACKET_OUT:
@@ -9828,6 +9985,10 @@ ofputil_is_bundlable(enum ofptype type)
     case OFPTYPE_NXT_TLV_TABLE_REQUEST:
     case OFPTYPE_NXT_TLV_TABLE_REPLY:
     case OFPTYPE_NXT_RESUME:
+    case OFPTYPE_IPFIX_BRIDGE_STATS_REQUEST:
+    case OFPTYPE_IPFIX_BRIDGE_STATS_REPLY:
+    case OFPTYPE_IPFIX_FLOW_STATS_REQUEST:
+    case OFPTYPE_IPFIX_FLOW_STATS_REPLY:
         break;
     }
 
@@ -9892,13 +10053,14 @@ ofputil_encode_bundle_add(enum ofp_version ofp_version,
     request = ofpraw_alloc_xid(ofp_version == OFP13_VERSION
                                ? OFPRAW_ONFT13_BUNDLE_ADD_MESSAGE
                                : OFPRAW_OFPT14_BUNDLE_ADD_MESSAGE, ofp_version,
-                               msg->msg->xid, 0);
+                               msg->msg->xid, ntohs(msg->msg->length));
     m = ofpbuf_put_zeros(request, sizeof *m);
 
     m->bundle_id = htonl(msg->bundle_id);
     m->flags = htons(msg->flags);
     ofpbuf_put(request, msg->msg, ntohs(msg->msg->length));
 
+    ofpmsg_update_length(request);
     return request;
 }
 

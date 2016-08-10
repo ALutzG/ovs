@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2009, 2010, 2011, 2012, 2013, 2014, 2015 Nicira, Inc.
+ * Copyright (c) 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016 Nicira, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -55,7 +55,7 @@
 #include "openvswitch/dynamic-string.h"
 #include "fatal-signal.h"
 #include "hash.h"
-#include "hmap.h"
+#include "openvswitch/hmap.h"
 #include "netdev-provider.h"
 #include "netdev-vport.h"
 #include "netlink-notifier.h"
@@ -67,12 +67,13 @@
 #include "packets.h"
 #include "poll-loop.h"
 #include "rtnetlink.h"
-#include "shash.h"
+#include "openvswitch/shash.h"
 #include "socket-util.h"
 #include "sset.h"
 #include "timer.h"
 #include "unaligned.h"
 #include "openvswitch/vlog.h"
+#include "util.h"
 
 VLOG_DEFINE_THIS_MODULE(netdev_linux);
 
@@ -418,6 +419,7 @@ static const struct tc_ops tc_ops_codel;
 static const struct tc_ops tc_ops_fqcodel;
 static const struct tc_ops tc_ops_sfq;
 static const struct tc_ops tc_ops_default;
+static const struct tc_ops tc_ops_noop;
 static const struct tc_ops tc_ops_other;
 
 static const struct tc_ops *const tcs[] = {
@@ -426,6 +428,7 @@ static const struct tc_ops *const tcs[] = {
     &tc_ops_codel,              /* Controlled delay */
     &tc_ops_fqcodel,            /* Fair queue controlled delay */
     &tc_ops_sfq,                /* Stochastic fair queueing */
+    &tc_ops_noop,               /* Non operating qos type. */
     &tc_ops_default,            /* Default qdisc (see tc-pfifo_fast(8)). */
     &tc_ops_other,              /* Some other qdisc. */
     NULL
@@ -1089,8 +1092,7 @@ netdev_linux_rxq_recv_tap(int fd, struct dp_packet *buffer)
 }
 
 static int
-netdev_linux_rxq_recv(struct netdev_rxq *rxq_, struct dp_packet **packets,
-                      int *c)
+netdev_linux_rxq_recv(struct netdev_rxq *rxq_, struct dp_packet_batch *batch)
 {
     struct netdev_rxq_linux *rx = netdev_rxq_linux_cast(rxq_);
     struct netdev *netdev = rx->up.netdev;
@@ -1115,9 +1117,8 @@ netdev_linux_rxq_recv(struct netdev_rxq *rxq_, struct dp_packet **packets,
         }
         dp_packet_delete(buffer);
     } else {
-        dp_packet_pad(buffer);
-        packets[0] = buffer;
-        *c = 1;
+        batch->packets[0] = buffer;
+        batch->count = 1;
     }
 
     return retval;
@@ -1159,16 +1160,20 @@ netdev_linux_rxq_drain(struct netdev_rxq *rxq_)
  * expected to do additional queuing of packets. */
 static int
 netdev_linux_send(struct netdev *netdev_, int qid OVS_UNUSED,
-                  struct dp_packet **pkts, int cnt, bool may_steal)
+                  struct dp_packet_batch *batch, bool may_steal,
+                  bool concurrent_txq OVS_UNUSED)
 {
     int i;
     int error = 0;
 
     /* 'i' is incremented only if there's no error */
-    for (i = 0; i < cnt;) {
-        const void *data = dp_packet_data(pkts[i]);
-        size_t size = dp_packet_size(pkts[i]);
+    for (i = 0; i < batch->count;) {
+        const void *data = dp_packet_data(batch->packets[i]);
+        size_t size = dp_packet_size(batch->packets[i]);
         ssize_t retval;
+
+        /* Truncate the packet if it is configured. */
+        size -= dp_packet_get_cutlen(batch->packets[i]);
 
         if (!is_tap_netdev(netdev_)) {
             /* Use our AF_PACKET socket to send to this device. */
@@ -1218,15 +1223,20 @@ netdev_linux_send(struct netdev *netdev_, int qid OVS_UNUSED,
         }
 
         if (retval < 0) {
-            /* The Linux AF_PACKET implementation never blocks waiting for room
-             * for packets, instead returning ENOBUFS.  Translate this into
-             * EAGAIN for the caller. */
-            error = errno == ENOBUFS ? EAGAIN : errno;
-            if (error == EINTR) {
-                /* continue without incrementing 'i', i.e. retry this packet */
+            if (errno == EINTR) {
+                /* The send was interrupted by a signal.  Retry the packet by
+                 * continuing without incrementing 'i'.*/
                 continue;
+            } else if (errno == EIO && is_tap_netdev(netdev_)) {
+                /* The Linux tap driver returns EIO if the device is not up.
+                 * From the OVS side this is not an error, so ignore it. */
+            } else {
+                /* The Linux AF_PACKET implementation never blocks waiting for
+                 * room for packets, instead returning ENOBUFS.  Translate this
+                 * into EAGAIN for the caller. */
+                error = errno == ENOBUFS ? EAGAIN : errno;
+                break;
             }
-            break;
         } else if (retval != size) {
             VLOG_WARN_RL(&rl, "sent partial Ethernet packet (%"PRIuSIZE" bytes"
                               " of %"PRIuSIZE") on %s", retval, size,
@@ -1239,11 +1249,7 @@ netdev_linux_send(struct netdev *netdev_, int qid OVS_UNUSED,
         i++;
     }
 
-    if (may_steal) {
-        for (i = 0; i < cnt; i++) {
-            dp_packet_delete(pkts[i]);
-        }
-    }
+    dp_packet_delete_batch(batch, may_steal);
 
     if (error && error != EAGAIN) {
             VLOG_WARN_RL(&rl, "error sending Ethernet packet on %s: %s",
@@ -2101,7 +2107,6 @@ netdev_linux_get_qos_types(const struct netdev *netdev OVS_UNUSED,
                            struct sset *types)
 {
     const struct tc_ops *const *opsp;
-
     for (opsp = tcs; *opsp != NULL; opsp++) {
         const struct tc_ops *ops = *opsp;
         if (ops->tc_install && ops->ovs_name[0] != '\0') {
@@ -2204,6 +2209,10 @@ netdev_linux_set_qos(struct netdev *netdev_,
     new_ops = tc_lookup_ovs_name(type);
     if (!new_ops || !new_ops->tc_install) {
         return EOPNOTSUPP;
+    }
+
+    if (new_ops == &tc_ops_noop) {
+        return new_ops->tc_install(netdev_, details);
     }
 
     ovs_mutex_lock(&netdev->mutex);
@@ -2766,7 +2775,7 @@ netdev_linux_update_flags(struct netdev *netdev_, enum netdev_flags off,
     NULL,                       /* push header */               \
     NULL,                       /* pop header */                \
     NULL,                       /* get_numa_id */               \
-    NULL,                       /* set_multiq */                \
+    NULL,                       /* set_tx_multiq */             \
                                                                 \
     netdev_linux_send,                                          \
     netdev_linux_send_wait,                                     \
@@ -2806,6 +2815,7 @@ netdev_linux_update_flags(struct netdev *netdev_, enum netdev_flags off,
     netdev_linux_arp_lookup,                                    \
                                                                 \
     netdev_linux_update_flags,                                  \
+    NULL,                       /* reconfigure */               \
                                                                 \
     netdev_linux_rxq_alloc,                                     \
     netdev_linux_rxq_construct,                                 \
@@ -2927,17 +2937,9 @@ static void
 codel_parse_qdisc_details__(struct netdev *netdev OVS_UNUSED,
                             const struct smap *details, struct codel *codel)
 {
-    const char *target_s;
-    const char *limit_s;
-    const char *interval_s;
-
-    target_s = smap_get(details, "target");
-    limit_s = smap_get(details, "limit");
-    interval_s = smap_get(details, "interval");
-
-    codel->target = target_s ? strtoull(target_s, NULL, 10) : 0;
-    codel->limit = limit_s ? strtoull(limit_s, NULL, 10) : 0;
-    codel->interval = interval_s ? strtoull(interval_s, NULL, 10) : 0;
+    codel->target = smap_get_ullong(details, "target", 0);
+    codel->limit = smap_get_ullong(details, "limit", 0);
+    codel->interval = smap_get_ullong(details, "interval", 0);
 
     if (!codel->target) {
         codel->target = 5000;
@@ -3158,22 +3160,12 @@ static void
 fqcodel_parse_qdisc_details__(struct netdev *netdev OVS_UNUSED,
                           const struct smap *details, struct fqcodel *fqcodel)
 {
-    const char *target_s;
-    const char *limit_s;
-    const char *interval_s;
-    const char *flows_s;
-    const char *quantum_s;
+    fqcodel->target = smap_get_ullong(details, "target", 0);
+    fqcodel->limit = smap_get_ullong(details, "limit", 0);
+    fqcodel->interval = smap_get_ullong(details, "interval", 0);
+    fqcodel->flows = smap_get_ullong(details, "flows", 0);
+    fqcodel->quantum = smap_get_ullong(details, "quantum", 0);
 
-    target_s = smap_get(details, "target");
-    limit_s = smap_get(details, "limit");
-    interval_s = smap_get(details, "interval");
-    flows_s = smap_get(details, "flows");
-    quantum_s = smap_get(details, "quantum");
-    fqcodel->target = target_s ? strtoull(target_s, NULL, 10) : 0;
-    fqcodel->limit = limit_s ? strtoull(limit_s, NULL, 10) : 0;
-    fqcodel->interval = interval_s ? strtoull(interval_s, NULL, 10) : 0;
-    fqcodel->flows = flows_s ? strtoull(flows_s, NULL, 10) : 0;
-    fqcodel->quantum = quantum_s ? strtoull(quantum_s, NULL, 10) : 0;
     if (!fqcodel->target) {
         fqcodel->target = 5000;
     }
@@ -3394,27 +3386,20 @@ static void
 sfq_parse_qdisc_details__(struct netdev *netdev,
                           const struct smap *details, struct sfq *sfq)
 {
-    const char *perturb_s;
-    const char *quantum_s;
-    int mtu;
-    int mtu_error;
+    sfq->perturb = smap_get_ullong(details, "perturb", 0);
+    sfq->quantum = smap_get_ullong(details, "quantum", 0);
 
-    perturb_s = smap_get(details, "perturb");
-    quantum_s = smap_get(details, "quantum");
-    sfq->perturb = perturb_s ? strtoull(perturb_s, NULL, 10) : 0;
-    sfq->quantum = quantum_s ? strtoull(quantum_s, NULL, 10) : 0;
     if (!sfq->perturb) {
         sfq->perturb = 10;
     }
 
     if (!sfq->quantum) {
-        mtu_error = netdev_linux_get_mtu__(netdev_linux_cast(netdev), &mtu);
-        if (!mtu_error) {
+        int mtu;
+        if (!netdev_linux_get_mtu__(netdev_linux_cast(netdev), &mtu)) {
             sfq->quantum = mtu;
         } else {
             VLOG_WARN_RL(&rl, "when using SFQ, you must specify quantum on a "
                          "device without mtu");
-            return;
         }
     }
 }
@@ -3687,10 +3672,8 @@ htb_parse_qdisc_details__(struct netdev *netdev_,
                           const struct smap *details, struct htb_class *hc)
 {
     struct netdev_linux *netdev = netdev_linux_cast(netdev_);
-    const char *max_rate_s;
 
-    max_rate_s = smap_get(details, "max-rate");
-    hc->max_rate = max_rate_s ? strtoull(max_rate_s, NULL, 10) / 8 : 0;
+    hc->max_rate = smap_get_ullong(details, "max-rate", 0) / 8;
     if (!hc->max_rate) {
         enum netdev_features current;
 
@@ -3708,10 +3691,6 @@ htb_parse_class_details__(struct netdev *netdev,
                           const struct smap *details, struct htb_class *hc)
 {
     const struct htb *htb = htb_get__(netdev);
-    const char *min_rate_s = smap_get(details, "min-rate");
-    const char *max_rate_s = smap_get(details, "max-rate");
-    const char *burst_s = smap_get(details, "burst");
-    const char *priority_s = smap_get(details, "priority");
     int mtu, error;
 
     error = netdev_linux_get_mtu__(netdev_linux_cast(netdev), &mtu);
@@ -3723,14 +3702,15 @@ htb_parse_class_details__(struct netdev *netdev,
 
     /* HTB requires at least an mtu sized min-rate to send any traffic even
      * on uncongested links. */
-    hc->min_rate = min_rate_s ? strtoull(min_rate_s, NULL, 10) / 8 : 0;
+    hc->min_rate = smap_get_ullong(details, "min-rate", 0) / 8;
     hc->min_rate = MAX(hc->min_rate, mtu);
     hc->min_rate = MIN(hc->min_rate, htb->max_rate);
 
     /* max-rate */
-    hc->max_rate = (max_rate_s
-                    ? strtoull(max_rate_s, NULL, 10) / 8
-                    : htb->max_rate);
+    hc->max_rate = smap_get_ullong(details, "max-rate", 0) / 8;
+    if (!hc->max_rate) {
+        hc->max_rate = htb->max_rate;
+    }
     hc->max_rate = MAX(hc->max_rate, hc->min_rate);
     hc->max_rate = MIN(hc->max_rate, htb->max_rate);
 
@@ -3743,11 +3723,11 @@ htb_parse_class_details__(struct netdev *netdev,
      * doesn't include the Ethernet header, we need to add at least 14 (18?) to
      * the MTU.  We actually add 64, instead of 14, as a guard against
      * additional headers get tacked on somewhere that we're not aware of. */
-    hc->burst = burst_s ? strtoull(burst_s, NULL, 10) / 8 : 0;
+    hc->burst = smap_get_ullong(details, "burst", 0) / 8;
     hc->burst = MAX(hc->burst, mtu + 64);
 
     /* priority */
-    hc->priority = priority_s ? strtoul(priority_s, NULL, 10) : 0;
+    hc->priority = smap_get_ullong(details, "priority", 0);
 
     return 0;
 }
@@ -4165,12 +4145,8 @@ hfsc_parse_qdisc_details__(struct netdev *netdev_, const struct smap *details,
                            struct hfsc_class *class)
 {
     struct netdev_linux *netdev = netdev_linux_cast(netdev_);
-    uint32_t max_rate;
-    const char *max_rate_s;
 
-    max_rate_s = smap_get(details, "max-rate");
-    max_rate   = max_rate_s ? strtoull(max_rate_s, NULL, 10) / 8 : 0;
-
+    uint32_t max_rate = smap_get_ullong(details, "max-rate", 0) / 8;
     if (!max_rate) {
         enum netdev_features current;
 
@@ -4190,19 +4166,14 @@ hfsc_parse_class_details__(struct netdev *netdev,
 {
     const struct hfsc *hfsc;
     uint32_t min_rate, max_rate;
-    const char *min_rate_s, *max_rate_s;
 
     hfsc       = hfsc_get__(netdev);
-    min_rate_s = smap_get(details, "min-rate");
-    max_rate_s = smap_get(details, "max-rate");
 
-    min_rate = min_rate_s ? strtoull(min_rate_s, NULL, 10) / 8 : 0;
+    min_rate = smap_get_ullong(details, "min-rate", 0) / 8;
     min_rate = MAX(min_rate, 1);
     min_rate = MIN(min_rate, hfsc->max_rate);
 
-    max_rate = (max_rate_s
-                ? strtoull(max_rate_s, NULL, 10) / 8
-                : hfsc->max_rate);
+    max_rate = smap_get_ullong(details, "max-rate", hfsc->max_rate * 8) / 8;
     max_rate = MAX(max_rate, min_rate);
     max_rate = MIN(max_rate, hfsc->max_rate);
 
@@ -4486,6 +4457,48 @@ static const struct tc_ops tc_ops_hfsc = {
     hfsc_class_delete,          /* class_delete */
     hfsc_class_get_stats,       /* class_get_stats */
     hfsc_class_dump_stats       /* class_dump_stats */
+};
+
+/* "linux-noop" traffic control class. */
+
+static void
+noop_install__(struct netdev *netdev_)
+{
+    struct netdev_linux *netdev = netdev_linux_cast(netdev_);
+    static const struct tc tc = TC_INITIALIZER(&tc, &tc_ops_default);
+
+    netdev->tc = CONST_CAST(struct tc *, &tc);
+}
+
+static int
+noop_tc_install(struct netdev *netdev,
+                   const struct smap *details OVS_UNUSED)
+{
+    noop_install__(netdev);
+    return 0;
+}
+
+static int
+noop_tc_load(struct netdev *netdev, struct ofpbuf *nlmsg OVS_UNUSED)
+{
+    noop_install__(netdev);
+    return 0;
+}
+
+static const struct tc_ops tc_ops_noop = {
+    NULL,                       /* linux_name */
+    "linux-noop",               /* ovs_name */
+    0,                          /* n_queues */
+    noop_tc_install,
+    noop_tc_load,
+    NULL,                       /* tc_destroy */
+    NULL,                       /* qdisc_get */
+    NULL,                       /* qdisc_set */
+    NULL,                       /* class_get */
+    NULL,                       /* class_set */
+    NULL,                       /* class_delete */
+    NULL,                       /* class_get_stats */
+    NULL                        /* class_dump_stats */
 };
 
 /* "linux-default" traffic control class.

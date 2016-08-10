@@ -27,6 +27,7 @@
 #include "openvswitch/netdev.h"
 #include "openflow/netronome-ext.h"
 #include "openflow/nicira-ext.h"
+#include "openvswitch/ofp-msgs.h"
 #include "openvswitch/ofpbuf.h"
 #include "openvswitch/types.h"
 #include "openvswitch/type-props.h"
@@ -324,9 +325,6 @@ struct ofputil_flow_mod {
     uint16_t importance;     /* Eviction precedence. */
     struct ofpact *ofpacts;  /* Series of "struct ofpact"s. */
     size_t ofpacts_len;      /* Length of ofpacts, in bytes. */
-
-    /* Reason for delete; ignored for non-delete commands */
-    enum ofp_flow_removed_reason delete_reason;
 };
 
 enum ofperr ofputil_decode_flow_mod(struct ofputil_flow_mod *,
@@ -1139,6 +1137,25 @@ int ofputil_decode_port_stats(struct ofputil_port_stats *, struct ofpbuf *msg);
 enum ofperr ofputil_decode_port_stats_request(const struct ofp_header *request,
                                               ofp_port_t *ofp10_port);
 
+struct ofputil_ipfix_stats {
+    uint32_t collector_set_id;  /* Used only for flow-based IPFIX statistics. */
+    uint64_t total_flows;  /* Totabl flows of this IPFIX exporter. */
+    uint64_t current_flows;  /* Current flows of this IPFIX exporter. */
+    uint64_t pkts;  /* Successfully sampled packets. */
+    uint64_t ipv4_pkts;  /* Successfully sampled IPV4 packets. */
+    uint64_t ipv6_pkts;  /* Successfully sampled IPV6 packets. */
+    uint64_t error_pkts;  /* Error packets when sampling. */
+    uint64_t ipv4_error_pkts;  /* Error IPV4 packets when sampling. */
+    uint64_t ipv6_error_pkts;  /* Error IPV6 packets when sampling. */
+    uint64_t tx_pkts;  /* TX IPFIX packets. */
+    uint64_t tx_errors;  /* IPFIX packets TX errors. */
+};
+
+void ofputil_append_ipfix_stat(struct ovs_list *replies,
+                              const struct ofputil_ipfix_stats *ois);
+size_t ofputil_count_ipfix_stats(const struct ofp_header *);
+int ofputil_pull_ipfix_stats(struct ofputil_ipfix_stats *, struct ofpbuf *msg);
+
 struct ofputil_queue_stats_request {
     ofp_port_t port_no;           /* OFPP_ANY means "all ports". */
     uint32_t queue_id;
@@ -1243,6 +1260,9 @@ struct ofputil_group_desc {
     struct ofputil_group_props props; /* Group properties. */
 };
 
+void ofputil_group_properties_destroy(struct ofputil_group_props *);
+void ofputil_group_properties_copy(struct ofputil_group_props *to,
+                                   const struct ofputil_group_props *from);
 void ofputil_bucket_list_destroy(struct ovs_list *buckets);
 void ofputil_bucket_clone_list(struct ovs_list *dest,
                                const struct ovs_list *src,
@@ -1305,8 +1325,6 @@ struct ofputil_bundle_add_msg {
     const struct ofp_header   *msg;
 };
 
-enum ofptype;
-
 enum ofperr ofputil_decode_bundle_ctrl(const struct ofp_header *,
                                        struct ofputil_bundle_ctrl_msg *);
 
@@ -1321,6 +1339,19 @@ struct ofpbuf *ofputil_encode_bundle_add(enum ofp_version ofp_version,
 enum ofperr ofputil_decode_bundle_add(const struct ofp_header *,
                                       struct ofputil_bundle_add_msg *,
                                       enum ofptype *type);
+
+struct ofputil_bundle_msg {
+    enum ofptype type;
+    union {
+        struct ofputil_flow_mod fm;
+        struct ofputil_group_mod gm;
+    };
+};
+
+/* Destroys 'bms'. */
+void ofputil_encode_bundle_msgs(struct ofputil_bundle_msg *bms, size_t n_bms,
+                                struct ovs_list *requests,
+                                enum ofputil_protocol);
 
 struct ofputil_tlv_map {
     struct ovs_list list_node;

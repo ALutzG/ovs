@@ -162,6 +162,9 @@ do_start_ovsdb () {
                 log_warning_msg "$db (from \$EXTRA_DBS) cannot be read as a database (see error message above)"
             fi
         done
+        if test X"$SELF_CONFINEMENT" = Xno; then
+            set "$@" --no-self-confinement
+        fi
         set "$@" -vconsole:emer -vsyslog:err -vfile:info
         set "$@" --remote=punix:"$DB_SOCK"
         set "$@" --private-key=db:Open_vSwitch,SSL,private_key
@@ -199,9 +202,14 @@ add_managers () {
     # churn in the database at startup or restart.  (For example, managers
     # won't briefly see empty datapath-id or ofport columns for records that
     # exist at startup.)
-    action "Enabling remote OVSDB managers" \
-	ovs-appctl -t ovsdb-server ovsdb-server/add-remote \
-	    db:Open_vSwitch,Open_vSwitch,manager_options
+    if test X"$OVSDB_SERVER" = Xyes || test X"$OVS_VSWITCHD" = Xyes; then
+        if daemon_is_running ovsdb-server \
+                && daemon_is_running ovs-vswitchd; then
+            action "Enabling remote OVSDB managers" \
+                   ovs-appctl -t ovsdb-server ovsdb-server/add-remote \
+                   db:Open_vSwitch,Open_vSwitch,manager_options
+        fi
+    fi
 }
 
 do_start_forwarding () {
@@ -221,13 +229,16 @@ do_start_forwarding () {
             ulimit -n $MAXFD
         fi
 
-	    # Start ovs-vswitchd.
-	    set ovs-vswitchd unix:"$DB_SOCK"
-	    set "$@" -vconsole:emer -vsyslog:err -vfile:info
-	    if test X"$MLOCKALL" != Xno; then
-	        set "$@" --mlockall
-	    fi
-	    start_daemon "$OVS_VSWITCHD_PRIORITY" "$OVS_VSWITCHD_WRAPPER" "$@"
+        # Start ovs-vswitchd.
+        set ovs-vswitchd unix:"$DB_SOCK"
+        set "$@" -vconsole:emer -vsyslog:err -vfile:info
+        if test X"$MLOCKALL" != Xno; then
+            set "$@" --mlockall
+        fi
+        if test X"$SELF_CONFINEMENT" = Xno; then
+            set "$@" --no-self-confinement
+        fi
+        start_daemon "$OVS_VSWITCHD_PRIORITY" "$OVS_VSWITCHD_WRAPPER" "$@"
     fi
 }
 
@@ -487,6 +498,8 @@ set_defaults () {
     DAEMON_CWD=/
     FORCE_COREFILES=yes
     MLOCKALL=yes
+    SELF_CONFINEMENT=yes
+    MONITOR=yes
     OVSDB_SERVER=yes
     OVS_VSWITCHD=yes
     OVSDB_SERVER_PRIORITY=-10
@@ -561,7 +574,6 @@ Less important options for "start", "restart" and "force-reload-kmod":
 
 Debugging options for "start", "restart" and "force-reload-kmod":
   --ovsdb-server-wrapper=WRAPPER
-  --ovs-vswitchd-wrapper=WRAPPER
   --ovs-vswitchd-wrapper=WRAPPER
      run specified daemon under WRAPPER (either 'valgrind' or 'strace')
 

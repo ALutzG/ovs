@@ -90,6 +90,9 @@ struct dpif_backer_support {
     /* True if the datapath supports OVS_FLOW_ATTR_UFID. */
     bool ufid;
 
+    /* True if the datapath supports OVS_ACTION_ATTR_TRUNC action. */
+    bool trunc;
+
     /* Each member represents support for related OVS_KEY_ATTR_* fields. */
     struct odp_support odp;
 };
@@ -97,10 +100,10 @@ struct dpif_backer_support {
 bool ofproto_dpif_get_enable_ufid(const struct dpif_backer *backer);
 struct dpif_backer_support *ofproto_dpif_get_support(const struct ofproto_dpif *);
 
-cls_version_t ofproto_dpif_get_tables_version(struct ofproto_dpif *);
+ovs_version_t ofproto_dpif_get_tables_version(struct ofproto_dpif *);
 
 struct rule_dpif *rule_dpif_lookup_from_table(struct ofproto_dpif *,
-                                              cls_version_t, struct flow *,
+                                              ovs_version_t, struct flow *,
                                               struct flow_wildcards *,
                                               const struct dpif_flow_stats *,
                                               uint8_t *table_id,
@@ -133,11 +136,11 @@ void rule_dpif_reduce_timeouts(struct rule_dpif *rule, uint16_t idle_timeout,
 void group_dpif_credit_stats(struct group_dpif *,
                              struct ofputil_bucket *,
                              const struct dpif_flow_stats *);
-bool group_dpif_lookup(struct ofproto_dpif *ofproto, uint32_t group_id,
-                       struct group_dpif **group);
+struct group_dpif *group_dpif_lookup(struct ofproto_dpif *ofproto,
+                                     uint32_t group_id, ovs_version_t version,
+                                     bool take_ref);
+const struct ovs_list *group_dpif_get_buckets(const struct group_dpif *group);
 
-void group_dpif_get_buckets(const struct group_dpif *group,
-                            const struct ovs_list **buckets);
 enum ofp11_group_type group_dpif_get_type(const struct group_dpif *group);
 const char *group_dpif_get_selection_method(const struct group_dpif *group);
 uint64_t group_dpif_get_selection_method_param(const struct group_dpif *group);
@@ -154,7 +157,8 @@ int ofproto_dpif_execute_actions__(struct ofproto_dpif *, const struct flow *,
 void ofproto_dpif_send_async_msg(struct ofproto_dpif *,
                                  struct ofproto_async_msg *);
 bool ofproto_dpif_wants_packet_in_on_miss(struct ofproto_dpif *);
-int ofproto_dpif_send_packet(const struct ofport_dpif *, struct dp_packet *);
+int ofproto_dpif_send_packet(const struct ofport_dpif *, bool oam,
+                             struct dp_packet *);
 void ofproto_dpif_flow_mod(struct ofproto_dpif *,
                            const struct ofputil_flow_mod *);
 struct rule_dpif *ofproto_dpif_refresh_rule(struct rule_dpif *);

@@ -47,7 +47,7 @@
 #include "packets.h"
 #include "poll-loop.h"
 #include "seq.h"
-#include "shash.h"
+#include "openvswitch/shash.h"
 #include "smap.h"
 #include "sset.h"
 #include "svec.h"
@@ -109,12 +109,6 @@ int
 netdev_n_rxq(const struct netdev *netdev)
 {
     return netdev->n_rxq;
-}
-
-int
-netdev_requested_n_rxq(const struct netdev *netdev)
-{
-    return netdev->requested_n_rxq;
 }
 
 bool
@@ -345,7 +339,8 @@ netdev_open(const char *name, const char *type, struct netdev **netdevp)
     if (!netdev) {
         struct netdev_registered_class *rc;
 
-        rc = netdev_lookup_class(type && type[0] ? type : "system");
+        type = type && type[0] ? type : "system";
+        rc = netdev_lookup_class(type);
         if (rc && ovs_refcount_try_ref_rcu(&rc->refcnt)) {
             netdev = rc->class->alloc();
             if (netdev) {
@@ -353,12 +348,14 @@ netdev_open(const char *name, const char *type, struct netdev **netdevp)
                 netdev->netdev_class = rc->class;
                 netdev->name = xstrdup(name);
                 netdev->change_seq = 1;
+                netdev->reconfigure_seq = seq_create();
+                netdev->last_reconfigure_seq =
+                    seq_read(netdev->reconfigure_seq);
                 netdev->node = shash_add(&netdev_shash, name, netdev);
 
                 /* By default enable one tx and rx queue per netdev. */
                 netdev->n_txq = netdev->netdev_class->send ? 1 : 0;
                 netdev->n_rxq = netdev->netdev_class->rxq_alloc ? 1 : 0;
-                netdev->requested_n_rxq = netdev->n_rxq;
 
                 ovs_list_init(&netdev->saved_flags_list);
 
@@ -380,6 +377,11 @@ netdev_open(const char *name, const char *type, struct netdev **netdevp)
                       name, type);
             error = EAFNOSUPPORT;
         }
+    } else if (type && strcmp(type, netdev_get_type(netdev))) {
+        VLOG_WARN("trying to create netdev %s of different type %s,"
+                  " already is %s\n",
+                  name, type, netdev_get_type(netdev));
+        error = EEXIST;
     } else {
         error = 0;
     }
@@ -500,6 +502,7 @@ netdev_unref(struct netdev *dev)
             shash_delete(&netdev_shash, dev->node);
         }
         free(dev->name);
+        seq_destroy(dev->reconfigure_seq);
         dev->netdev_class->dealloc(dev);
         ovs_mutex_unlock(&netdev_mutex);
 
@@ -611,14 +614,15 @@ netdev_rxq_close(struct netdev_rxq *rx)
     }
 }
 
-/* Attempts to receive a batch of packets from 'rx'.  'pkts' should point to
- * the beginning of an array of MAX_RX_BATCH pointers to dp_packet.  If
- * successful, this function stores pointers to up to MAX_RX_BATCH dp_packets
- * into the array, transferring ownership of the packets to the caller, stores
- * the number of received packets into '*cnt', and returns 0.
+/* Attempts to receive a batch of packets from 'rx'.  'batch' should point to
+ * the beginning of an array of NETDEV_MAX_BURST pointers to dp_packet.  If
+ * successful, this function stores pointers to up to NETDEV_MAX_BURST
+ * dp_packets into the array, transferring ownership of the packets to the
+ * caller, stores the number of received packets in 'batch->count', and returns
+ * 0.
  *
  * The implementation does not necessarily initialize any non-data members of
- * 'pkts'.  That is, the caller must initialize layer pointers and metadata
+ * 'batch'.  That is, the caller must initialize layer pointers and metadata
  * itself, if desired, e.g. with pkt_metadata_init() and miniflow_extract().
  *
  * Returns EAGAIN immediately if no packet is ready to be received or another
@@ -628,7 +632,7 @@ netdev_rxq_recv(struct netdev_rxq *rx, struct dp_packet_batch *batch)
 {
     int retval;
 
-    retval = rx->netdev->netdev_class->rxq_recv(rx, batch->packets, &batch->count);
+    retval = rx->netdev->netdev_class->rxq_recv(rx, batch);
     if (!retval) {
         COVERAGE_INC(netdev_received);
     } else {
@@ -654,44 +658,34 @@ netdev_rxq_drain(struct netdev_rxq *rx)
             : 0);
 }
 
-/* Configures the number of tx queues and rx queues of 'netdev'.
- * Return 0 if successful, otherwise a positive errno value.
- *
- * 'n_rxq' specifies the maximum number of receive queues to create.
- * The netdev provider might choose to create less (e.g. if the hardware
- * supports only a smaller number).  The caller can check how many have been
- * actually created by calling 'netdev_n_rxq()'
+/* Configures the number of tx queues of 'netdev'. Returns 0 if successful,
+ * otherwise a positive errno value.
  *
  * 'n_txq' specifies the exact number of transmission queues to create.
- * If this function returns successfully, the caller can make 'n_txq'
- * concurrent calls to netdev_send() (each one with a different 'qid' in the
- * range [0..'n_txq'-1]).
  *
- * On error, the tx queue and rx queue configuration is indeterminant.
- * Caller should make decision on whether to restore the previous or
- * the default configuration.  Also, caller must make sure there is no
- * other thread accessing the queues at the same time. */
+ * The change might not effective immediately.  The caller must check if a
+ * reconfiguration is required with netdev_is_reconf_required() and eventually
+ * call netdev_reconfigure() before using the new queues.
+ *
+ * On error, the tx queue configuration is unchanged */
 int
-netdev_set_multiq(struct netdev *netdev, unsigned int n_txq,
-                  unsigned int n_rxq)
+netdev_set_tx_multiq(struct netdev *netdev, unsigned int n_txq)
 {
     int error;
 
-    error = (netdev->netdev_class->set_multiq
-             ? netdev->netdev_class->set_multiq(netdev,
-                                                MAX(n_txq, 1),
-                                                MAX(n_rxq, 1))
+    error = (netdev->netdev_class->set_tx_multiq
+             ? netdev->netdev_class->set_tx_multiq(netdev, MAX(n_txq, 1))
              : EOPNOTSUPP);
 
     if (error && error != EOPNOTSUPP) {
-        VLOG_DBG_RL(&rl, "failed to set tx/rx queue for network device %s:"
+        VLOG_DBG_RL(&rl, "failed to set tx queue for network device %s:"
                     "%s", netdev_get_name(netdev), ovs_strerror(error));
     }
 
     return error;
 }
 
-/* Sends 'buffers' on 'netdev'.  Returns 0 if successful (for every packet),
+/* Sends 'batch' on 'netdev'.  Returns 0 if successful (for every packet),
  * otherwise a positive errno value.  Returns EAGAIN without blocking if
  * at least one the packets cannot be queued immediately.  Returns EMSGSIZE
  * if a partial packet was transmitted or if a packet is too big or too small
@@ -704,6 +698,11 @@ netdev_set_multiq(struct netdev *netdev, unsigned int n_txq,
  * If 'may_steal' is true, the caller transfers ownership of all the packets
  * to the network device, regardless of success.
  *
+ * If 'concurrent_txq' is true, the caller may perform concurrent calls
+ * to netdev_send() with the same 'qid'. The netdev provider is responsible
+ * for making sure that these concurrent calls do not create a race condition
+ * by using locking or other synchronization if required.
+ *
  * The network device is expected to maintain one or more packet
  * transmission queues, so that the caller does not ordinarily have to
  * do additional queuing of packets.  'qid' specifies the queue to use
@@ -714,18 +713,20 @@ netdev_set_multiq(struct netdev *netdev, unsigned int n_txq,
  * cases this function will always return EOPNOTSUPP. */
 int
 netdev_send(struct netdev *netdev, int qid, struct dp_packet_batch *batch,
-            bool may_steal)
+            bool may_steal, bool concurrent_txq)
 {
     if (!netdev->netdev_class->send) {
         dp_packet_delete_batch(batch, may_steal);
         return EOPNOTSUPP;
     }
 
-    int error = netdev->netdev_class->send(netdev, qid,
-                                           batch->packets, batch->count,
-                                           may_steal);
+    int error = netdev->netdev_class->send(netdev, qid, batch, may_steal,
+                                           concurrent_txq);
     if (!error) {
         COVERAGE_INC(netdev_sent);
+        if (!may_steal) {
+            dp_packet_batch_reset_cutlen(batch);
+        }
     }
     return error;
 }
@@ -751,12 +752,26 @@ netdev_pop_header(struct netdev *netdev, struct dp_packet_batch *batch)
     batch->count = n_cnt;
 }
 
-int
-netdev_build_header(const struct netdev *netdev, struct ovs_action_push_tnl *data,
-                    const struct flow *tnl_flow)
+void
+netdev_init_tnl_build_header_params(struct netdev_tnl_build_header_params *params,
+                                    const struct flow *tnl_flow,
+                                    const struct in6_addr *src,
+                                    struct eth_addr dmac,
+                                    struct eth_addr smac)
+{
+    params->flow = tnl_flow;
+    params->dmac = dmac;
+    params->smac = smac;
+    params->s_ip = src;
+    params->is_ipv6 = !IN6_IS_ADDR_V4MAPPED(src);
+}
+
+int netdev_build_header(const struct netdev *netdev,
+                        struct ovs_action_push_tnl *data,
+                        const struct netdev_tnl_build_header_params *params)
 {
     if (netdev->netdev_class->build_header) {
-        return netdev->netdev_class->build_header(netdev, data, tnl_flow);
+        return netdev->netdev_class->build_header(netdev, data, params);
     }
     return EOPNOTSUPP;
 }
@@ -1907,3 +1922,38 @@ netdev_get_addrs(const char dev[], struct in6_addr **paddr,
     return 0;
 }
 #endif
+
+void
+netdev_wait_reconf_required(struct netdev *netdev)
+{
+    seq_wait(netdev->reconfigure_seq, netdev->last_reconfigure_seq);
+}
+
+bool
+netdev_is_reconf_required(struct netdev *netdev)
+{
+    return seq_read(netdev->reconfigure_seq) != netdev->last_reconfigure_seq;
+}
+
+/* Give a chance to 'netdev' to reconfigure some of its parameters.
+ *
+ * If a module uses netdev_send() and netdev_rxq_recv(), it must call this
+ * function when netdev_is_reconf_required() returns true.
+ *
+ * Return 0 if successful, otherwise a positive errno value.  If the
+ * reconfiguration fails the netdev will not be able to send or receive
+ * packets.
+ *
+ * When this function is called, no call to netdev_rxq_recv() or netdev_send()
+ * must be issued. */
+int
+netdev_reconfigure(struct netdev *netdev)
+{
+    const struct netdev_class *class = netdev->netdev_class;
+
+    netdev->last_reconfigure_seq = seq_read(netdev->reconfigure_seq);
+
+    return (class->reconfigure
+            ? class->reconfigure(netdev)
+            : EOPNOTSUPP);
+}

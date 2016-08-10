@@ -29,7 +29,7 @@
 #include "dirs.h"
 #include "dpif.h"
 #include "hash.h"
-#include "hmap.h"
+#include "openvswitch/hmap.h"
 #include "hmapx.h"
 #include "if-notifier.h"
 #include "jsonrpc.h"
@@ -55,7 +55,7 @@
 #include "seq.h"
 #include "sflow_api.h"
 #include "sha1.h"
-#include "shash.h"
+#include "openvswitch/shash.h"
 #include "smap.h"
 #include "socket-util.h"
 #include "stream.h"
@@ -89,6 +89,7 @@ struct iface {
 
     /* These members are valid only within bridge_reconfigure(). */
     const char *type;           /* Usually same as cfg->type. */
+    const char *netdev_type;    /* type that should be used for netdev_open. */
     const struct ovsrec_interface *cfg;
 };
 
@@ -654,6 +655,8 @@ bridge_reconfigure(const struct ovsrec_open_vswitch *ovs_cfg)
                                      &iface->cfg->bfd);
                 ofproto_port_set_lldp(br->ofproto, iface->ofp_port,
                                       &iface->cfg->lldp);
+                ofproto_port_set_config(br->ofproto, iface->ofp_port,
+                                        &iface->cfg->other_config);
             }
         }
         bridge_configure_mirrors(br);
@@ -765,7 +768,7 @@ bridge_delete_or_reconfigure_ports(struct bridge *br)
             goto delete;
         }
 
-        if (strcmp(ofproto_port.type, iface->type)
+        if (strcmp(ofproto_port.type, iface->netdev_type)
             || netdev_set_config(iface->netdev, &iface->cfg->options, NULL)) {
             /* The interface is the wrong type or can't be configured.
              * Delete it. */
@@ -1165,6 +1168,7 @@ bridge_configure_ipfix(struct bridge *br)
     struct ofproto_ipfix_bridge_exporter_options be_opts;
     struct ofproto_ipfix_flow_exporter_options *fe_opts = NULL;
     size_t n_fe_opts = 0;
+    const char *virtual_obs_id;
 
     OVSREC_FLOW_SAMPLE_COLLECTOR_SET_FOR_EACH(fe_cfg, idl) {
         if (ovsrec_fscs_is_valid(fe_cfg, br)) {
@@ -1209,6 +1213,9 @@ bridge_configure_ipfix(struct bridge *br)
 
         be_opts.enable_output_sampling = !smap_get_bool(&be_cfg->other_config,
                                               "enable-output-sampling", false);
+
+        virtual_obs_id = smap_get(&be_cfg->other_config, "virtual_obs_id");
+        be_opts.virtual_obs_id = nullable_xstrdup(virtual_obs_id);
     }
 
     if (n_fe_opts > 0) {
@@ -1225,6 +1232,12 @@ bridge_configure_ipfix(struct bridge *br)
                     ? *fe_cfg->ipfix->cache_active_timeout : 0;
                 opts->cache_max_flows = fe_cfg->ipfix->cache_max_flows
                     ? *fe_cfg->ipfix->cache_max_flows : 0;
+                opts->enable_tunnel_sampling = smap_get_bool(
+                                                   &fe_cfg->ipfix->other_config,
+                                                  "enable-tunnel-sampling", true);
+                virtual_obs_id = smap_get(&fe_cfg->ipfix->other_config,
+                                          "virtual_obs_id");
+                opts->virtual_obs_id = nullable_xstrdup(virtual_obs_id);
                 opts++;
             }
         }
@@ -1235,6 +1248,7 @@ bridge_configure_ipfix(struct bridge *br)
 
     if (valid_be_cfg) {
         sset_destroy(&be_opts.targets);
+        free(be_opts.virtual_obs_id);
     }
 
     if (n_fe_opts > 0) {
@@ -1242,6 +1256,7 @@ bridge_configure_ipfix(struct bridge *br)
         size_t i;
         for (i = 0; i < n_fe_opts; i++) {
             sset_destroy(&opts->targets);
+            free(opts->virtual_obs_id);
             opts++;
         }
         free(fe_opts);
@@ -1415,12 +1430,9 @@ port_configure_rstp(const struct ofproto *ofproto, struct port *port,
         port_s->priority = RSTP_DEFAULT_PORT_PRIORITY;
     }
 
-    config_str = smap_get(&port->cfg->other_config, "rstp-admin-p2p-mac");
-    if (config_str) {
-        port_s->admin_p2p_mac_state = strtoul(config_str, NULL, 0);
-    } else {
-        port_s->admin_p2p_mac_state = RSTP_ADMIN_P2P_MAC_FORCE_TRUE;
-    }
+    port_s->admin_p2p_mac_state = smap_get_ullong(
+        &port->cfg->other_config, "rstp-admin-p2p-mac",
+        RSTP_ADMIN_P2P_MAC_FORCE_TRUE);
 
     port_s->admin_port_state = smap_get_bool(&port->cfg->other_config,
                                              "rstp-admin-port-state", true);
@@ -1461,33 +1473,17 @@ bridge_configure_stp(struct bridge *br, bool enable_stp)
             br_s.system_id = eth_addr_to_uint64(br->ea);
         }
 
-        config_str = smap_get(&br->cfg->other_config, "stp-priority");
-        if (config_str) {
-            br_s.priority = strtoul(config_str, NULL, 0);
-        } else {
-            br_s.priority = STP_DEFAULT_BRIDGE_PRIORITY;
-        }
+        br_s.priority = smap_get_ullong(&br->cfg->other_config, "stp-priority",
+                                        STP_DEFAULT_BRIDGE_PRIORITY);
+        br_s.hello_time = smap_get_ullong(&br->cfg->other_config,
+                                          "stp-hello-time",
+                                          STP_DEFAULT_HELLO_TIME);
 
-        config_str = smap_get(&br->cfg->other_config, "stp-hello-time");
-        if (config_str) {
-            br_s.hello_time = strtoul(config_str, NULL, 10) * 1000;
-        } else {
-            br_s.hello_time = STP_DEFAULT_HELLO_TIME;
-        }
-
-        config_str = smap_get(&br->cfg->other_config, "stp-max-age");
-        if (config_str) {
-            br_s.max_age = strtoul(config_str, NULL, 10) * 1000;
-        } else {
-            br_s.max_age = STP_DEFAULT_MAX_AGE;
-        }
-
-        config_str = smap_get(&br->cfg->other_config, "stp-forward-delay");
-        if (config_str) {
-            br_s.fwd_delay = strtoul(config_str, NULL, 10) * 1000;
-        } else {
-            br_s.fwd_delay = STP_DEFAULT_FWD_DELAY;
-        }
+        br_s.max_age = smap_get_ullong(&br->cfg->other_config, "stp-max-age",
+                                       STP_DEFAULT_HELLO_TIME / 1000) * 1000;
+        br_s.fwd_delay = smap_get_ullong(&br->cfg->other_config,
+                                         "stp-forward-delay",
+                                         STP_DEFAULT_FWD_DELAY / 1000) * 1000;
 
         /* Configure STP on the bridge. */
         if (ofproto_set_stp(br->ofproto, &br_s)) {
@@ -1556,49 +1552,19 @@ bridge_configure_rstp(struct bridge *br, bool enable_rstp)
             br_s.address = eth_addr_to_uint64(br->ea);
         }
 
-        config_str = smap_get(&br->cfg->other_config, "rstp-priority");
-        if (config_str) {
-            br_s.priority = strtoul(config_str, NULL, 0);
-        } else {
-            br_s.priority = RSTP_DEFAULT_PRIORITY;
-        }
-
-        config_str = smap_get(&br->cfg->other_config, "rstp-ageing-time");
-        if (config_str) {
-            br_s.ageing_time = strtoul(config_str, NULL, 0);
-        } else {
-            br_s.ageing_time = RSTP_DEFAULT_AGEING_TIME;
-        }
-
-        config_str = smap_get(&br->cfg->other_config,
-                              "rstp-force-protocol-version");
-        if (config_str) {
-            br_s.force_protocol_version = strtoul(config_str, NULL, 0);
-        } else {
-            br_s.force_protocol_version = FPV_DEFAULT;
-        }
-
-        config_str = smap_get(&br->cfg->other_config, "rstp-max-age");
-        if (config_str) {
-            br_s.bridge_max_age = strtoul(config_str, NULL, 10);
-        } else {
-            br_s.bridge_max_age = RSTP_DEFAULT_BRIDGE_MAX_AGE;
-        }
-
-        config_str = smap_get(&br->cfg->other_config, "rstp-forward-delay");
-        if (config_str) {
-            br_s.bridge_forward_delay = strtoul(config_str, NULL, 10);
-        } else {
-            br_s.bridge_forward_delay = RSTP_DEFAULT_BRIDGE_FORWARD_DELAY;
-        }
-
-        config_str = smap_get(&br->cfg->other_config,
-                              "rstp-transmit-hold-count");
-        if (config_str) {
-            br_s.transmit_hold_count = strtoul(config_str, NULL, 10);
-        } else {
-            br_s.transmit_hold_count = RSTP_DEFAULT_TRANSMIT_HOLD_COUNT;
-        }
+        const struct smap *oc = &br->cfg->other_config;
+        br_s.priority = smap_get_ullong(oc, "rstp-priority",
+                                        RSTP_DEFAULT_PRIORITY);
+        br_s.ageing_time = smap_get_ullong(oc, "rstp-ageing-time",
+                                           RSTP_DEFAULT_AGEING_TIME);
+        br_s.force_protocol_version = smap_get_ullong(
+            oc, "rstp-force-protocol-version", FPV_DEFAULT);
+        br_s.bridge_max_age = smap_get_ullong(oc, "rstp-max-age",
+                                              RSTP_DEFAULT_BRIDGE_MAX_AGE);
+        br_s.bridge_forward_delay = smap_get_ullong(
+            oc, "rstp-forward-delay", RSTP_DEFAULT_BRIDGE_FORWARD_DELAY);
+        br_s.transmit_hold_count = smap_get_ullong(
+            oc, "rstp-transmit-hold-count", RSTP_DEFAULT_TRANSMIT_HOLD_COUNT);
 
         /* Configure RSTP on the bridge. */
         if (ofproto_set_rstp(br->ofproto, &br_s)) {
@@ -1727,6 +1693,7 @@ iface_do_create(const struct bridge *br,
 {
     struct netdev *netdev = NULL;
     int error;
+    const char *type;
 
     if (netdev_is_reserved_name(iface_cfg->name)) {
         VLOG_WARN("could not create interface %s, name is reserved",
@@ -1735,8 +1702,9 @@ iface_do_create(const struct bridge *br,
         goto error;
     }
 
-    error = netdev_open(iface_cfg->name,
-                        iface_get_type(iface_cfg, br->cfg), &netdev);
+    type = ofproto_port_open_type(br->cfg->datapath_type,
+                                  iface_get_type(iface_cfg, br->cfg));
+    error = netdev_open(iface_cfg->name, type, &netdev);
     if (error) {
         VLOG_WARN_BUF(errp, "could not open network device %s (%s)",
                       iface_cfg->name, ovs_strerror(error));
@@ -1808,6 +1776,8 @@ iface_create(struct bridge *br, const struct ovsrec_interface *iface_cfg,
     iface->ofp_port = ofp_port;
     iface->netdev = netdev;
     iface->type = iface_get_type(iface_cfg, br->cfg);
+    iface->netdev_type = ofproto_port_open_type(br->cfg->datapath_type,
+                                                iface->type);
     iface->cfg = iface_cfg;
     hmap_insert(&br->ifaces, &iface->ofp_port_node,
                 hash_ofp_port(ofp_port));
@@ -1857,21 +1827,16 @@ bridge_configure_forward_bpdu(struct bridge *br)
 static void
 bridge_configure_mac_table(struct bridge *br)
 {
-    const char *idle_time_str;
-    int idle_time;
+    const struct smap *oc = &br->cfg->other_config;
+    int idle_time = smap_get_int(oc, "mac-aging-time", 0);
+    if (!idle_time) {
+        idle_time = MAC_ENTRY_DEFAULT_IDLE_TIME;
+    }
 
-    const char *mac_table_size_str;
-    int mac_table_size;
-
-    idle_time_str = smap_get(&br->cfg->other_config, "mac-aging-time");
-    idle_time = (idle_time_str && atoi(idle_time_str)
-                 ? atoi(idle_time_str)
-                 : MAC_ENTRY_DEFAULT_IDLE_TIME);
-
-    mac_table_size_str = smap_get(&br->cfg->other_config, "mac-table-size");
-    mac_table_size = (mac_table_size_str && atoi(mac_table_size_str)
-                      ? atoi(mac_table_size_str)
-                      : MAC_DEFAULT_MAX);
+    int mac_table_size = smap_get_int(oc, "mac-table-size", 0);
+    if (!mac_table_size) {
+        mac_table_size = MAC_DEFAULT_MAX;
+    }
 
     ofproto_set_mac_table_config(br->ofproto, idle_time, mac_table_size);
 }
@@ -1885,24 +1850,17 @@ bridge_configure_mcast_snooping(struct bridge *br)
     } else {
         struct port *port;
         struct ofproto_mcast_snooping_settings br_s;
-        const char *idle_time_str;
-        const char *max_entries_str;
 
-        idle_time_str = smap_get(&br->cfg->other_config,
-                                 "mcast-snooping-aging-time");
-        br_s.idle_time = (idle_time_str && atoi(idle_time_str)
-                          ? atoi(idle_time_str)
-                          : MCAST_ENTRY_DEFAULT_IDLE_TIME);
-
-        max_entries_str = smap_get(&br->cfg->other_config,
-                                   "mcast-snooping-table-size");
-        br_s.max_entries = (max_entries_str && atoi(max_entries_str)
-                            ? atoi(max_entries_str)
+        const struct smap *oc = &br->cfg->other_config;
+        int idle_time = smap_get_int(oc, "mcast-snooping-aging-time", 0);
+        br_s.idle_time = idle_time ? idle_time : MCAST_ENTRY_DEFAULT_IDLE_TIME;
+        int max_entries = smap_get_int(oc, "mcast-snooping-table-size", 0);
+        br_s.max_entries = (max_entries
+                            ? max_entries
                             : MCAST_DEFAULT_MAX_ENTRIES);
 
-        br_s.flood_unreg = !smap_get_bool(&br->cfg->other_config,
-                                    "mcast-snooping-disable-flood-unregistered",
-                                    false);
+        br_s.flood_unreg = !smap_get_bool(
+            oc, "mcast-snooping-disable-flood-unregistered", false);
 
         /* Configure multicast snooping on the bridge */
         if (ofproto_set_mcast_snooping(br->ofproto, &br_s)) {
@@ -1985,6 +1943,9 @@ find_local_hw_addr(const struct bridge *br, struct eth_addr *ea,
                 }
             }
 
+            /* A port always has at least one interface. */
+            ovs_assert(iface != NULL);
+
             /* The local port doesn't count (since we're trying to choose its
              * MAC address anyway). */
             if (iface->ofp_port == OFPP_LOCAL) {
@@ -2033,12 +1994,11 @@ static void
 bridge_pick_local_hw_addr(struct bridge *br, struct eth_addr *ea,
                           struct iface **hw_addr_iface)
 {
-    const char *hwaddr;
     *hw_addr_iface = NULL;
 
     /* Did the user request a particular MAC? */
-    hwaddr = smap_get(&br->cfg->other_config, "hwaddr");
-    if (hwaddr && eth_addr_from_string(hwaddr, ea)) {
+    const char *hwaddr = smap_get_def(&br->cfg->other_config, "hwaddr", "");
+    if (eth_addr_from_string(hwaddr, ea)) {
         if (eth_addr_is_multicast(*ea)) {
             VLOG_ERR("bridge %s: cannot set MAC address to multicast "
                      "address "ETH_ADDR_FMT, br->name, ETH_ADDR_ARGS(*ea));
@@ -2078,8 +2038,8 @@ bridge_pick_datapath_id(struct bridge *br,
     const char *datapath_id;
     uint64_t dpid;
 
-    datapath_id = smap_get(&br->cfg->other_config, "datapath-id");
-    if (datapath_id && dpid_from_string(datapath_id, &dpid)) {
+    datapath_id = smap_get_def(&br->cfg->other_config, "datapath-id", "");
+    if (dpid_from_string(datapath_id, &dpid)) {
         return dpid;
     }
 
@@ -3177,7 +3137,7 @@ qos_unixctl_show(struct unixctl_conn *conn, int argc OVS_UNUSED,
             unixctl_command_reply(conn, ds_cstr(&ds));
         } else {
             ds_put_format(&ds, "QoS not configured on %s\n", iface->name);
-            unixctl_command_reply_error(conn, ds_cstr(&ds));
+            unixctl_command_reply(conn, ds_cstr(&ds));
         }
     } else {
         ds_put_format(&ds, "%s: failed to retrieve QOS configuration (%s)\n",
@@ -3387,10 +3347,13 @@ bridge_del_ports(struct bridge *br, const struct shash *wanted_ports)
             const struct ovsrec_interface *cfg = port->interfaces[i];
             struct iface *iface = iface_lookup(br, cfg->name);
             const char *type = iface_get_type(cfg, br->cfg);
+            const char *dp_type = br->cfg->datapath_type;
+            const char *netdev_type = ofproto_port_open_type(dp_type, type);
 
             if (iface) {
                 iface->cfg = cfg;
                 iface->type = type;
+                iface->netdev_type = netdev_type;
             } else if (!strcmp(type, "null")) {
                 VLOG_WARN_ONCE("%s: The null interface type is deprecated and"
                                " may be removed in February 2013. Please email"
@@ -3558,8 +3521,9 @@ bridge_configure_remotes(struct bridge *br,
     for (i = 0; i < n_controllers; i++) {
         struct ovsrec_controller *c = controllers[i];
 
-        if (!strncmp(c->target, "punix:", 6)
-            || !strncmp(c->target, "unix:", 5)) {
+        if (daemon_should_self_confine()
+            && (!strncmp(c->target, "punix:", 6)
+            || !strncmp(c->target, "unix:", 5))) {
             static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 5);
             char *whitelist;
 
@@ -4126,8 +4090,8 @@ port_configure_lacp(struct port *port, struct lacp_settings *s)
                    ? priority
                    : UINT16_MAX - !ovs_list_is_short(&port->ifaces));
 
-    lacp_time = smap_get(&port->cfg->other_config, "lacp-time");
-    s->fast = lacp_time && !strcasecmp(lacp_time, "fast");
+    lacp_time = smap_get_def(&port->cfg->other_config, "lacp-time", "");
+    s->fast = !strcasecmp(lacp_time, "fast");
 
     s->fallback_ab_cfg = smap_get_bool(&port->cfg->other_config,
                                        "lacp-fallback-ab", false);
@@ -4269,7 +4233,7 @@ iface_get_type(const struct ovsrec_interface *iface,
         type = iface->type[0] ? iface->type : "system";
     }
 
-    return ofproto_port_open_type(br->datapath_type, type);
+    return type;
 }
 
 static void
@@ -4745,6 +4709,12 @@ mirror_configure(struct mirror *m)
         VLOG_ERR("bridge %s: mirror %s does not specify output; ignoring",
                  m->bridge->name, m->name);
         return false;
+    }
+
+    if (cfg->snaplen) {
+        s.snaplen = *cfg->snaplen;
+    } else {
+        s.snaplen = 0;
     }
 
     /* Get port selection. */

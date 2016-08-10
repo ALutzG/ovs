@@ -42,7 +42,7 @@
 #include "openvswitch/ofpbuf.h"
 #include "ovs-numa.h"
 #include "packets.h"
-#include "shash.h"
+#include "openvswitch/shash.h"
 #include "simap.h"
 #include "smap.h"
 #include "sset.h"
@@ -577,13 +577,10 @@ show_dpif(struct dpif *dpif, struct dpctl_params *dpctl_p)
                 smap_init(&config);
                 error = netdev_get_config(netdev, &config);
                 if (!error) {
-                    const struct smap_node **nodes;
-                    size_t i;
-
-                    nodes = smap_sort(&config);
-                    for (i = 0; i < smap_count(&config); i++) {
-                        const struct smap_node *node = nodes[i];
-                        dpctl_print(dpctl_p, "%c %s=%s", i ? ',' : ':',
+                    const struct smap_node **nodes = smap_sort(&config);
+                    for (size_t j = 0; j < smap_count(&config); j++) {
+                        const struct smap_node *node = nodes[j];
+                        dpctl_print(dpctl_p, "%c %s=%s", j ? ',' : ':',
                                     node->key, node->value);
                     }
                     free(nodes);
@@ -805,8 +802,8 @@ dpctl_dump_flows(int argc, const char *argv[], struct dpctl_params *dpctl_p)
     }
 
     if (filter) {
-        char *err = parse_ofp_exact_flow(&flow_filter, &wc_filter.masks,
-                                         filter, &names_portno);
+        char *err = parse_ofp_exact_flow(&flow_filter, &wc_filter, filter,
+                                         &names_portno);
         if (err) {
             dpctl_error(dpctl_p, 0, "Failed to parse filter (%s)", err);
             error = EINVAL;
@@ -1089,8 +1086,7 @@ dpctl_get_flow(int argc, const char *argv[], struct dpctl_params *dpctl_p)
         goto out;
     }
 
-    /* Does not work for DPDK, since do not know which 'pmd' to apply the
-     * operation.  So, just uses PMD_ID_NULL. */
+    /* In case of PMD will be returned flow from first PMD thread with match. */
     error = dpif_flow_get(dpif, NULL, 0, &ufid, PMD_ID_NULL, &buf, &flow);
     if (error) {
         dpctl_error(dpctl_p, error, "getting flow");

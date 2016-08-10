@@ -49,7 +49,7 @@ extern "C" {
  *      create multiple netdev_rxq objects for a single netdev and access each
  *      of those from a different thread.)
  *
- *    NETDEV_FOR_EACH_QUEUE
+ *    NETDEV_QUEUE_FOR_EACH
  *    netdev_queue_dump_next()
  *    netdev_queue_dump_done()
  *
@@ -109,7 +109,6 @@ bool netdev_is_reserved_name(const char *name);
 
 int netdev_n_txq(const struct netdev *netdev);
 int netdev_n_rxq(const struct netdev *netdev);
-int netdev_requested_n_rxq(const struct netdev *netdev);
 bool netdev_is_pmd(const struct netdev *netdev);
 
 /* Open and close. */
@@ -135,7 +134,7 @@ const char *netdev_get_type_from_name(const char *);
 int netdev_get_mtu(const struct netdev *, int *mtup);
 int netdev_set_mtu(const struct netdev *, int mtu);
 int netdev_get_ifindex(const struct netdev *);
-int netdev_set_multiq(struct netdev *, unsigned int n_txq, unsigned int n_rxq);
+int netdev_set_tx_multiq(struct netdev *, unsigned int n_txq);
 
 /* Packet reception. */
 int netdev_rxq_open(struct netdev *, struct netdev_rxq **, int id);
@@ -150,11 +149,29 @@ int netdev_rxq_drain(struct netdev_rxq *);
 
 /* Packet transmission. */
 int netdev_send(struct netdev *, int qid, struct dp_packet_batch *,
-                bool may_steal);
+                bool may_steal, bool concurrent_txq);
 void netdev_send_wait(struct netdev *, int qid);
 
+/* native tunnel APIs */
+/* Structure to pass parameters required to build a tunnel header. */
+struct netdev_tnl_build_header_params {
+    const struct flow *flow;
+    const struct in6_addr *s_ip;
+    struct eth_addr dmac;
+    struct eth_addr smac;
+    bool is_ipv6;
+};
+
+void
+netdev_init_tnl_build_header_params(struct netdev_tnl_build_header_params *params,
+                                    const struct flow *tnl_flow,
+                                    const struct in6_addr *src,
+                                    struct eth_addr dmac,
+                                    struct eth_addr smac);
+
 int netdev_build_header(const struct netdev *, struct ovs_action_push_tnl *data,
-                        const struct flow *tnl_flow);
+                        const struct netdev_tnl_build_header_params *params);
+
 int netdev_push_header(const struct netdev *netdev,
                        struct dp_packet_batch *,
                        const struct ovs_action_push_tnl *data);
@@ -242,6 +259,10 @@ int netdev_delete_queue(struct netdev *, unsigned int queue_id);
 int netdev_get_queue_stats(const struct netdev *, unsigned int queue_id,
                            struct netdev_queue_stats *);
 uint64_t netdev_get_change_seq(const struct netdev *);
+
+int netdev_reconfigure(struct netdev *netdev);
+void netdev_wait_reconf_required(struct netdev *netdev);
+bool netdev_is_reconf_required(struct netdev *netdev);
 
 struct netdev_queue_dump {
     struct netdev *netdev;
